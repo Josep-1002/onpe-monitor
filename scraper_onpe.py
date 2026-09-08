@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 URL_ONPE = "https://reclutamiento.onpe.gob.pe/convocatorias"
 STATE_FILE = "estado_previo.json"
 
-# Zonas prioritarias (Trujillo, distritos y La Libertad)
+# Zonas prioritarias (Trujillo y distritos)
 ZONAS_TRUJILLO = [
     "TRUJILLO",
     "LA ESPERANZA",
@@ -23,7 +23,7 @@ EMAIL_DESTINO = os.getenv("EMAIL_DESTINO")
 
 def enviar_correo(asunto, html_cuerpo):
     if not GMAIL_USER or not GMAIL_APP_PASS or not EMAIL_DESTINO:
-        print("[!] Faltan variables de entorno para enviar correo.")
+        print("[!] Faltan credenciales de Gmail.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -37,7 +37,7 @@ def enviar_correo(asunto, html_cuerpo):
             server.starttls()
             server.login(GMAIL_USER, GMAIL_APP_PASS)
             server.send_message(msg)
-        print(f"[+] Notificación enviada con éxito a {EMAIL_DESTINO}")
+        print(f"[+] Correo enviado a {EMAIL_DESTINO}")
     except Exception as e:
         print(f"[-] Error enviando correo: {e}")
 
@@ -66,75 +66,74 @@ def extraer_convocatorias():
         )
         page = context.new_page()
 
-        print(f"[*] Conectando a {URL_ONPE}...")
+        print(f"[*] Navegando a {URL_ONPE}...")
         try:
-            page.goto(URL_ONPE, wait_until="networkidle", timeout=45000)
-            page.wait_for_selector(".card-normal", timeout=20000)
+            page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)
         except Exception as e:
-            print(f"[-] Error al cargar la página: {e}")
+            print(f"[-] Error de conexión: {e}")
             browser.close()
             return datos
 
-        total_ofertas = page.locator(".card-normal").count()
-        print(f"[*] Total de ofertas laborales detectadas: {total_ofertas}")
+        # Detectar la cantidad de tarjetas de ofertas
+        tarjetas = page.locator(".card-normal")
+        total = tarjetas.count()
+        print(f"[*] Convocatorias detectadas: {total}")
 
-        for i in range(total_ofertas):
+        if total == 0:
+            browser.close()
+            return datos
+
+        # Extraemos primero los títulos de cada puesto
+        titulos = []
+        for i in range(total):
+            t = tarjetas.nth(i).locator("h2").first.inner_text().strip()
+            titulos.append(t if t else f"Puesto #{i+1}")
+
+        # Recorremos cada oferta de forma limpia recargando la vista
+        for idx, puesto in enumerate(titulos):
+            print(f"[{idx+1}/{total}] Analizando sedes de: {puesto}...")
             try:
-                # Nos aseguramos de estar en la vista principal con las tarjetas
+                # Si no estamos en la página principal con las tarjetas, volvemos a entrar
                 if page.locator(".card-normal").count() == 0:
-                    page.goto(URL_ONPE, wait_until="networkidle", timeout=30000)
-                    page.wait_for_selector(".card-normal", timeout=15000)
+                    page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
 
-                tarjetas = page.locator(".card-normal")
-                tarjeta = tarjetas.nth(i)
+                card_actual = page.locator(".card-normal").nth(idx)
+                btn_detalle = card_actual.locator("button.button-none, button:has-text('Ver Detalle')")
 
-                # Obtener el título del puesto
-                titulo = tarjeta.locator("h2").first.inner_text().strip()
-                print(f"[{i+1}/{total_ofertas}] Analizando: {titulo}...")
-
-                # Hacer clic en el botón 'Ver Detalle'
-                boton_detalle = tarjeta.locator("button.button-none")
-                if boton_detalle.count() > 0:
-                    boton_detalle.first.click()
+                if btn_detalle.count() > 0:
+                    btn_detalle.first.click()
                 else:
-                    tarjeta.click()
+                    card_actual.click()
 
-                # Esperar a que cargue la lista de sedes ODPE
+                # Esperamos a que cargue la lista de sedes ODPE
                 page.wait_for_timeout(2000)
 
-                # Extraer todos los ítems de sedes con sus plazos
-                sedes_raw = page.locator("li").all_inner_texts()
-                sedes_encontradas = [s.strip() for s in sedes_raw if "Cantidad requerida:" in s or "Plazo para postulación:" in s]
+                # Extraer todos los ítems <li> (ej: LA VICTORIA (Cantidad requerida: 3)...)
+                items_li = page.locator("li").all_inner_texts()
+                sedes_validas = [li.strip() for li in items_li if "Cantidad requerida:" in li or "Plazo para postulación:" in li]
 
-                # Filtrar si alguna corresponde a Trujillo o distritos
-                zonas_detectadas = []
-                for s in sedes_encontradas:
-                    for zona in ZONAS_TRUJILLO:
-                        if re.search(rf"\b{re.escape(zona)}\b", s.upper()):
-                            zonas_detectadas.append(s)
+                # Comprobar si figura Trujillo o sus distritos
+                zonas_encontradas = []
+                for s in sedes_validas:
+                    for z in ZONAS_TRUJILLO:
+                        if re.search(rf"\b{re.escape(z)}\b", s.upper()):
+                            zonas_encontradas.append(s)
+                            break
 
-                datos[titulo] = {
-                    "total_sedes": len(sedes_encontradas),
-                    "sedes": sedes_encontradas,
-                    "sedes_trujillo": zonas_detectadas
+                datos[puesto] = {
+                    "total_sedes": len(sedes_validas),
+                    "sedes": sedes_validas,
+                    "sedes_trujillo": zonas_encontradas
                 }
 
-                # Regresar a la lista de ofertas
-                boton_volver = page.locator("button:has-text('Volver'), a:has-text('Volver'), button:has-text('Regresar')")
-                if boton_volver.count() > 0 and boton_volver.first.is_visible():
-                    boton_volver.first.click()
-                    page.wait_for_timeout(1000)
-                else:
-                    page.go_back()
-                    page.wait_for_timeout(1000)
+                # Volvemos a la lista principal para la siguiente oferta
+                page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
 
             except Exception as err:
-                print(f"[-] Error en oferta {i}: {err}")
-                # Si falló la navegación, recargamos la URL principal
-                try:
-                    page.goto(URL_ONPE, wait_until="networkidle", timeout=30000)
-                except Exception:
-                    pass
+                print(f"[-] Error en {puesto}: {err}")
                 continue
 
         browser.close()
@@ -143,14 +142,14 @@ def extraer_convocatorias():
 
 def procesar_cambios(datos_actuales):
     if not datos_actuales:
-        print("[!] No se extrajeron datos en este ciclo.")
+        print("[!] No se obtuvieron datos en esta vuelta.")
         return
 
     estado_previo = cargar_estado()
-    
-    # 1. Si es la primera ejecución con este nuevo scraper
+
+    # 1. Primer escaneo
     if not estado_previo:
-        print("[+] Guardando estado base...")
+        print("[+] Guardando estado inicial...")
         guardar_estado(datos_actuales)
 
         trujillo_ahora = []
@@ -169,7 +168,7 @@ def procesar_cambios(datos_actuales):
 
             cuerpo = f"""
             <html><body style="font-family: Arial, sans-serif;">
-            <h2 style="color: #d9534f;">¡Atención! Se detectaron plazas en Trujillo / La Libertad:</h2>
+            <h2 style="color: #d9534f;">¡Atención! Se detectaron plazas en Trujillo:</h2>
             {items_html}
             <br>
             <a href="{URL_ONPE}" style="background-color: #d9534f; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
@@ -180,13 +179,13 @@ def procesar_cambios(datos_actuales):
             enviar_correo(asunto, cuerpo)
         else:
             asunto = f"✅ Monitor ONPE Activo: {len(datos_actuales)} Ofertas Monitoreadas"
-            resumen_puestos = "".join([f"<li>{p} ({val['total_sedes']} sedes registradas)</li>" for p, val in datos_actuales.items()])
+            resumen_puestos = "".join([f"<li><b>{p}</b> ({val['total_sedes']} sedes a nivel nacional)</li>" for p, val in datos_actuales.items()])
             cuerpo = f"""
             <html><body style="font-family: Arial, sans-serif;">
             <h3 style="color: #0275d8;">El monitor está funcionando correctamente.</h3>
-            <p>Se están vigilando <b>{len(datos_actuales)} ofertas laborales</b> cada 30 minutos:</p>
+            <p>Se están vigilando las <b>{len(datos_actuales)} ofertas laborales</b> cada 30 minutos:</p>
             <ul>{resumen_puestos}</ul>
-            <p><i>(Ninguna tiene sede habilitada para Trujillo en este instante. Te avisaremos en cuanto aparezca una).</i></p>
+            <p><i>(Ninguna tiene sede abierta para Trujillo en este momento. Te avisaremos apenas aparezca una).</i></p>
             <br>
             <a href="{URL_ONPE}" style="background-color: #0275d8; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px;">
                 Ver Portal ONPE
@@ -196,13 +195,13 @@ def procesar_cambios(datos_actuales):
             enviar_correo(asunto, cuerpo)
         return
 
-    # 2. Comparación contra el historial
+    # 2. Detección de cambios
     hay_cambios = False
     alertas_trujillo = []
     nuevas_generales = []
 
     for puesto, val in datos_actuales.items():
-        # Ver si apareció Trujillo en este puesto
+        # Caso A: Apareció sede en Trujillo
         if val["sedes_trujillo"]:
             sedes_antiguas = estado_previo.get(puesto, {}).get("sedes_trujillo", [])
             nuevas_sedes_trujillo = [s for s in val["sedes_trujillo"] if s not in sedes_antiguas]
@@ -210,14 +209,13 @@ def procesar_cambios(datos_actuales):
                 alertas_trujillo.append((puesto, nuevas_sedes_trujillo))
                 hay_cambios = True
 
-        # Ver si es un puesto 100% nuevo
+        # Caso B: Oferta laboral nueva en general
         if puesto not in estado_previo:
             nuevas_generales.append(puesto)
             hay_cambios = True
 
-    # Despachar correos
     if alertas_trujillo:
-        asunto = "🚨🚨 [URGENTE ONPE] ¡NUEVA PLAZA EN TRUJILLO / LA LIBERTAD! 🚨🚨"
+        asunto = "🚨🚨 [URGENTE ONPE] ¡PLAZA DISPONIBLE EN TRUJILLO! 🚨🚨"
         detalles_html = ""
         for p, sedes in alertas_trujillo:
             detalles_html += f"""
