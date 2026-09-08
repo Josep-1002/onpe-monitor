@@ -55,6 +55,7 @@ def cargar_estado():
 def guardar_estado(data):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[+] Estado guardado exitosamente en {STATE_FILE}")
 
 
 def extraer_convocatorias():
@@ -68,36 +69,44 @@ def extraer_convocatorias():
 
         print(f"[*] Navegando a {URL_ONPE}...")
         try:
-            page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(4000)
+            page.goto(URL_ONPE, wait_until="networkidle", timeout=60000)
         except Exception as e:
-            print(f"[-] Error de conexión: {e}")
+            print(f"[i] Aviso de carga: {e}")
+
+        # Espera activa hasta que Angular dibuje las tarjetas
+        try:
+            print("[*] Esperando a que Angular renderice las ofertas...")
+            page.wait_for_selector(".card-normal", timeout=35000)
+        except Exception:
+            print("[!] No se encontró '.card-normal'. Diagnóstico de lo que ve el navegador:")
+            print(f"URL actual: {page.url}")
+            print(f"Título: {page.title()}")
+            print(f"Texto visible:\n{page.locator('body').inner_text()[:600]}")
             browser.close()
             return datos
 
-        # Detectar la cantidad de tarjetas de ofertas
         tarjetas = page.locator(".card-normal")
         total = tarjetas.count()
-        print(f"[*] Convocatorias detectadas: {total}")
+        print(f"[*] ¡Convocatorias detectadas con éxito!: {total}")
 
         if total == 0:
             browser.close()
             return datos
 
-        # Extraemos primero los títulos de cada puesto
+        # Guardamos títulos
         titulos = []
         for i in range(total):
             t = tarjetas.nth(i).locator("h2").first.inner_text().strip()
             titulos.append(t if t else f"Puesto #{i+1}")
 
-        # Recorremos cada oferta de forma limpia recargando la vista
+        # Analizamos las sedes de cada una
         for idx, puesto in enumerate(titulos):
             print(f"[{idx+1}/{total}] Analizando sedes de: {puesto}...")
             try:
-                # Si no estamos en la página principal con las tarjetas, volvemos a entrar
+                # Si no estamos en la vista de tarjetas, volvemos
                 if page.locator(".card-normal").count() == 0:
-                    page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(3000)
+                    page.goto(URL_ONPE, wait_until="networkidle", timeout=45000)
+                    page.wait_for_selector(".card-normal", timeout=25000)
 
                 card_actual = page.locator(".card-normal").nth(idx)
                 btn_detalle = card_actual.locator("button.button-none, button:has-text('Ver Detalle')")
@@ -107,14 +116,14 @@ def extraer_convocatorias():
                 else:
                     card_actual.click()
 
-                # Esperamos a que cargue la lista de sedes ODPE
-                page.wait_for_timeout(2000)
+                # Esperar a que cargue la lista de sedes
+                page.wait_for_selector("li", timeout=15000)
+                page.wait_for_timeout(1000)
 
-                # Extraer todos los ítems <li> (ej: LA VICTORIA (Cantidad requerida: 3)...)
                 items_li = page.locator("li").all_inner_texts()
                 sedes_validas = [li.strip() for li in items_li if "Cantidad requerida:" in li or "Plazo para postulación:" in li]
 
-                # Comprobar si figura Trujillo o sus distritos
+                # Filtrar si alguna es de Trujillo
                 zonas_encontradas = []
                 for s in sedes_validas:
                     for z in ZONAS_TRUJILLO:
@@ -128,12 +137,12 @@ def extraer_convocatorias():
                     "sedes_trujillo": zonas_encontradas
                 }
 
-                # Volvemos a la lista principal para la siguiente oferta
-                page.goto(URL_ONPE, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
+                # Volver a la lista de ofertas
+                page.goto(URL_ONPE, wait_until="networkidle", timeout=45000)
+                page.wait_for_selector(".card-normal", timeout=25000)
 
             except Exception as err:
-                print(f"[-] Error en {puesto}: {err}")
+                print(f"[-] Error analizando {puesto}: {err}")
                 continue
 
         browser.close()
@@ -147,7 +156,7 @@ def procesar_cambios(datos_actuales):
 
     estado_previo = cargar_estado()
 
-    # 1. Primer escaneo
+    # 1. Primer escaneo exitoso
     if not estado_previo:
         print("[+] Guardando estado inicial...")
         guardar_estado(datos_actuales)
@@ -201,7 +210,6 @@ def procesar_cambios(datos_actuales):
     nuevas_generales = []
 
     for puesto, val in datos_actuales.items():
-        # Caso A: Apareció sede en Trujillo
         if val["sedes_trujillo"]:
             sedes_antiguas = estado_previo.get(puesto, {}).get("sedes_trujillo", [])
             nuevas_sedes_trujillo = [s for s in val["sedes_trujillo"] if s not in sedes_antiguas]
@@ -209,7 +217,6 @@ def procesar_cambios(datos_actuales):
                 alertas_trujillo.append((puesto, nuevas_sedes_trujillo))
                 hay_cambios = True
 
-        # Caso B: Oferta laboral nueva en general
         if puesto not in estado_previo:
             nuevas_generales.append(puesto)
             hay_cambios = True
